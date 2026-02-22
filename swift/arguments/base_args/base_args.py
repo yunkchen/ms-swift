@@ -250,6 +250,8 @@ class BaseArguments(GenerationArguments, QuantizeArguments, DataArguments, Templ
             'new_special_tokens',
             'num_labels',
             'problem_type',
+            'task_weights',
+            'point_cloud_dim',
             'rope_scaling',
             'max_model_len',
             # quant_args

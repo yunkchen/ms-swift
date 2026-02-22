@@ -120,16 +120,38 @@ class EncodePreprocessor(RowPreprocessor):
     def __init__(self, template: 'Template'):
         super().__init__()
         self.template = template
+        self._processed_count = 0  # 添加计数器用于调试
 
     def preprocess(self, row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        return self.template.encode(row, return_length=True)
+        import traceback
+        self._processed_count += 1
+
+        # 每100条打印一次进度，便于定位卡住的样本
+        if self._processed_count % 100 == 0:
+            logger.info(f"EncodePreprocessor: processing sample {self._processed_count}...")
+
+        # 打印关键调试信息（仅在debug级别）
+        images = row.get('images', [])
+        if images:
+            logger.debug(f"Sample {self._processed_count}: images={images[:2]}...")
+
+        try:
+            result = self.template.encode(row, return_length=True)
+            return result
+        except Exception as e:
+            logger.error(f"Error at sample {self._processed_count}: {e}")
+            logger.error(f"Row keys: {list(row.keys())}")
+            logger.error(f"Images: {row.get('images', 'N/A')}")
+            logger.error(traceback.format_exc())
+            raise
 
 
 class AddLengthPreprocessor(EncodePreprocessor):
 
     def preprocess(self, row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         encoded = super().preprocess(row)
-        row['lengths'] = encoded['lengths']
+        if encoded is not None:
+            row['lengths'] = encoded['lengths']
         return row
 
 

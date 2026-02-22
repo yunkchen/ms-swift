@@ -21,6 +21,7 @@ class StdTemplateInputs:
     tools: Optional[List[Tool]] = None
 
     label: Optional[int] = None
+    labels: Optional[List[float]] = None  # for multi-task regression
     channel: Optional[str] = None
 
     images: List[Union[str, Image.Image]] = field(default_factory=list)
@@ -58,9 +59,11 @@ class StdTemplateInputs:
     def from_dict(cls, inputs: Dict[str, Any]) -> 'StdTemplateInputs':
         inputs = deepcopy(inputs)
         kwargs = {}
-        for key in ['label', 'channel', 'margin', 'rejected_response']:
+        for key in ['label', 'labels', 'channel', 'margin', 'rejected_response']:
             if key in inputs:
                 kwargs[key] = inputs[key]
+                if key == 'labels':
+                    logger.info(f"[DEBUG] StdTemplateInputs.from_dict: Found 'labels' in inputs: {kwargs[key]}")
         messages = inputs['messages']
         tools = inputs.get('tools')
         objects = inputs.get('objects') or {}

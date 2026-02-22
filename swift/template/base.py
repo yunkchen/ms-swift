@@ -487,12 +487,45 @@ class Template(ProcessorMixin):
 
     def _seq_cls_encode(self, inputs: StdTemplateInputs) -> Dict[str, Any]:
         encoded = self._encode_truncated(inputs)
+
+        # Debug: Log what _encode_truncated returned
+        if isinstance(encoded, list):
+            logger.info(f"[DEBUG] _seq_cls_encode: _encode_truncated returned list of {len(encoded)} items")
+            if encoded and 'labels' in encoded[0]:
+                logger.info(f"[DEBUG] _seq_cls_encode: First item has labels with type {type(encoded[0]['labels'])}, "
+                           f"len={len(encoded[0]['labels']) if isinstance(encoded[0]['labels'], (list, tuple)) else 'N/A'}")
+        else:
+            if 'labels' in encoded:
+                logger.info(f"[DEBUG] _seq_cls_encode: encoded has labels with type {type(encoded['labels'])}, "
+                           f"len={len(encoded['labels']) if isinstance(encoded['labels'], (list, tuple)) else 'N/A'}")
+
+        # Determine the regression/classification labels
+        cls_labels = None
         if inputs.label is not None:
-            labels = inputs.label
+            cls_labels = inputs.label
             problem_type = self.config.problem_type
             if problem_type == 'single_label_classification':
-                labels = int(labels)
-            encoded['labels'] = labels
+                cls_labels = int(cls_labels)
+            logger.info(f"[DEBUG] _seq_cls_encode: Using inputs.label={cls_labels}")
+        elif inputs.labels is not None:
+            cls_labels = inputs.labels
+            logger.info(f"[DEBUG] _seq_cls_encode: Using inputs.labels={cls_labels}")
+        else:
+            # Debug: Log when no labels found
+            logger.warning(f"_seq_cls_encode: No labels found. inputs.label={inputs.label}, inputs.labels={inputs.labels}, "
+                          f"extra_kwargs keys: {list(inputs.extra_kwargs.keys())}")
+            if 'labels' in inputs.extra_kwargs:
+                logger.warning(f"_seq_cls_encode: labels found in extra_kwargs: {inputs.extra_kwargs['labels']}")
+
+        # Set labels on encoded result(s)
+        if cls_labels is not None:
+            # Handle both single dict and list of dicts (from split truncation)
+            if isinstance(encoded, list):
+                for enc in encoded:
+                    enc['labels'] = cls_labels
+            else:
+                encoded['labels'] = cls_labels
+
         return encoded
 
     @torch.inference_mode()
@@ -1316,12 +1349,20 @@ class Template(ProcessorMixin):
                     splited['length'] = self._get_length(splited.get('input_ids'), splited.get('labels'))
                     batched.append(splited)
                     i += self.max_length
+                # For seq_cls/embedding/reranker tasks, remove token-level labels
+                # The actual classification/regression labels are set by task-specific encode methods
+                if self.task_type in {'seq_cls', 'embedding', 'reranker', 'generative_reranker'}:
+                    for splited in batched:
+                        splited.pop('labels', None)
+                        splited.pop('loss_scale', None)
                 return batched
             else:
                 raise ValueError(f'Invalid truncation_strategy: {self.truncation_strategy}')
         encoded['length'] = length
         encoded['input_ids'] = input_ids
         if self.task_type in {'seq_cls', 'embedding', 'reranker', 'generative_reranker'}:
+            # Remove token-level labels - seq_cls uses classification/regression labels instead
+            # which are set by _seq_cls_encode
             encoded.pop('labels', None)
             encoded.pop('loss_scale', None)
         else:
@@ -1688,7 +1729,24 @@ class Template(ProcessorMixin):
                                batch: List[Dict[str, Any]],
                                *,
                                padding_to: Optional[int] = None) -> Dict[str, Any]:
+        # Check for labels directly in batch items (from properly formatted data)
         labels = [b.pop('labels') for b in batch if b.get('labels') is not None]
+
+        # Debug: Log the type and length of labels found
+        if labels:
+            logger.info(f"[DEBUG] _seq_cls_data_collator: Found {len(labels)} labels directly in batch. "
+                       f"First label type: {type(labels[0])}, "
+                       f"len: {len(labels[0]) if isinstance(labels[0], (list, tuple)) else 'N/A'}")
+
+        # Fallback: Check in _extra_kwargs (for data passed through extra_kwargs)
+        if not labels:
+            labels = [b['_extra_kwargs'].pop('labels') for b in batch
+                      if b.get('_extra_kwargs', {}).get('labels') is not None]
+            if labels:
+                logger.info(f"[DEBUG] _seq_cls_data_collator: Found {len(labels)} labels in _extra_kwargs. "
+                           f"First label type: {type(labels[0])}, "
+                           f"len: {len(labels[0]) if isinstance(labels[0], (list, tuple)) else 'N/A'}")
+
         res = self._data_collator(batch, padding_to=padding_to)
         if labels:
             problem_type = self.config.problem_type

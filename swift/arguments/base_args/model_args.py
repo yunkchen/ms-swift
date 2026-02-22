@@ -81,6 +81,8 @@ class ModelArguments:
 
     num_labels: Optional[int] = None
     problem_type: Literal['regression', 'single_label_classification', 'multi_label_classification'] = None
+    task_weights: Optional[str] = None  # Comma-separated weights for multi-task regression
+    point_cloud_dim: Optional[int] = None  # Dimension of point cloud features for regression models
     rope_scaling: Optional[str] = None
     device_map: Optional[Union[dict, str]] = None
     max_memory: Optional[Union[dict, str]] = None
@@ -243,5 +245,7 @@ class ModelArguments:
             'task_type': self.task_type,
             'num_labels': self.num_labels,
             'problem_type': self.problem_type,
+            'task_weights': self.task_weights,
+            'point_cloud_dim': self.point_cloud_dim,
             'init_strategy': self.init_strategy,
         }

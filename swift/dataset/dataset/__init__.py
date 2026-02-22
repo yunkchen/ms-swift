@@ -1,2 +1,2 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-from . import llm, mllm
+from . import llm, mllm, qwen_regression
