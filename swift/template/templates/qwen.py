@@ -695,7 +695,7 @@ class Qwen3VLPointCloudTemplate(Qwen3VLTemplate):
         # ---- point clouds ----
         if inputs.point_clouds:
             point_cloud_token_id = self.tokenizer.convert_tokens_to_ids(self.point_cloud_token)
-            num_queries = getattr(self.config, 'num_point_cloud_queries', 256)
+            num_queries = getattr(self.config, 'num_point_cloud_queries', 32)
 
             all_features = []
             point_cloud_sizes = []
