@@ -32,6 +32,7 @@ class MLLMModelArch:
     qwen2_audio = 'qwen2_audio'
     qwen2_5_omni = 'qwen2_5_omni'
     qwen3_vl = 'qwen3_vl'
+    qwen3_vl_point_cloud = 'qwen3_vl_point_cloud'
     qwen3_omni = 'qwen3_omni'
 
     cogvlm = 'cogvlm'
@@ -554,6 +555,15 @@ register_model_arch(
         MLLMModelArch.qwen3_vl,
         language_model=['model.language_model', 'lm_head'],
         aligner=['model.visual.merger', 'model.visual.deepstack_merger_list'],
+        vision_tower='model.visual',
+    ))
+
+register_model_arch(
+    MultiModelKeys(
+        MLLMModelArch.qwen3_vl_point_cloud,
+        language_model=['model.language_model', 'lm_head'],
+        aligner=['model.visual.merger', 'model.visual.deepstack_merger_list',
+                 'model.point_cloud_resampler', 'model.point_cloud_deepstack_projectors'],
         vision_tower='model.visual',
     ))
 

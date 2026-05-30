@@ -1081,6 +1081,32 @@ register_model(
         tags=['vision', 'video']))
 
 
+class Qwen3VLPointCloudLoader(Qwen3VLLoader):
+
+    def get_model(self, model_dir: str, config, processor, model_kwargs) -> PreTrainedModel:
+        model = super().get_model(model_dir, config, processor, model_kwargs)
+        # Add point cloud pad token to tokenizer
+        tokenizer = processor if isinstance(processor, PreTrainedTokenizerBase) else processor.tokenizer
+        point_cloud_token = '<|point_cloud_pad|>'
+        num_added = tokenizer.add_special_tokens({'additional_special_tokens': [point_cloud_token]})
+        if num_added > 0:
+            model.resize_token_embeddings(len(tokenizer))
+        config.point_cloud_token_id = tokenizer.convert_tokens_to_ids(point_cloud_token)
+        return model
+
+
+register_model(
+    ModelMeta(
+        MLLMModelType.qwen3_vl_point_cloud, [
+            ModelGroup([], TemplateType.qwen3_vl_point_cloud),
+        ],
+        Qwen3VLPointCloudLoader,
+        model_arch=ModelArch.qwen3_vl_point_cloud,
+        architectures=['Qwen3VLForConditionalGeneration'],
+        requires=['transformers>=4.57', 'qwen_vl_utils>=0.0.14', 'decord'],
+        tags=['vision', 'video', 'point_cloud']))
+
+
 class Qwen3VLMoeLoader(Qwen3VLLoader):
 
     def get_model(self, model_dir: str, config, processor, model_kwargs) -> PreTrainedModel:

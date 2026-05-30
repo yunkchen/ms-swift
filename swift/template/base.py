@@ -908,11 +908,11 @@ class Template(ProcessorMixin):
         res_loss_scale: List[float] = []  # result of loss_scale_list
 
         # reset
-        for k in ['video', 'audio', 'object', 'box']:
+        for k in ['video', 'audio', 'object', 'box', 'point_cloud']:
             setattr(inputs, f'{k}_idx', 0)
 
         for context, loss_scale in zip(context_list, loss_scale_list):
-            for k in ['video', 'audio']:
+            for k in ['video', 'audio', 'point_cloud']:
                 if context == f'<{k}>' and inputs.is_multimodal and getattr(inputs, f'{k}_idx') < len(
                         getattr(inputs, f'{k}s')):
                     c_list = self.replace_tag(k, getattr(inputs, f'{k}_idx'), inputs)
@@ -953,7 +953,7 @@ class Template(ProcessorMixin):
         total_content = '\n'.join(total_content)
         if inputs.system:
             total_content = f'{inputs.system}\n{total_content}'
-        for media_type in ['image', 'audio', 'video']:
+        for media_type in ['image', 'audio', 'video', 'point_cloud']:
             media_key, media_tag = f'{media_type}s', f'<{media_type}>'
             medias = getattr(inputs, media_key)
             if not isinstance(medias, list):

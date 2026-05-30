@@ -141,6 +141,7 @@ class MLLMModelType:
     qwen3_omni_moe = 'qwen3_omni_moe'
     qwen2_audio = 'qwen2_audio'
     qwen3_vl = 'qwen3_vl'
+    qwen3_vl_point_cloud = 'qwen3_vl_point_cloud'
     qwen3_vl_moe = 'qwen3_vl_moe'
     qwen3_vl_emb = 'qwen3_vl_emb'
     qwen3_vl_reranker = 'qwen3_vl_reranker'

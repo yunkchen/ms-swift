@@ -552,6 +552,191 @@ register_template(
         MLLMTemplateType.qwen3_vl, template_cls=Qwen3VLTemplate, default_system=None, thinking_prefix='<think>\n'))
 
 
+class Qwen3VLPointCloudTemplate(Qwen3VLTemplate):
+    """Template for Qwen3VL with point cloud feature input.
+
+    Handles <point_cloud> tags by loading .npy files, expanding placeholder tokens,
+    and passing point_cloud_features to the model.
+    """
+    point_cloud_token = '<|point_cloud_pad|>'
+    # Class-level caches: the dataset has only 8 unique point-cloud files and
+    # 33 unique images across 208k samples, so caching eliminates almost all
+    # repeated I/O from the network filesystem.
+    _pc_cache: Dict[str, torch.Tensor] = {}
+    _img_cache: Dict[str, 'Image.Image'] = {}  # path -> loaded + rescaled PIL Image
+    _fetch_img_cache: Dict[int, 'Image.Image'] = {}  # id(PIL) -> fetch_image result
+    _img_processor_cache: Dict[tuple, Dict[str, Any]] = {}  # tuple(id(img),...) -> image_processor output
+
+    # ---- profiling: measure _post_encode (pre_forward_hook payload) ----
+    def _post_encode(self, model, inputs: Dict[str, Any]) -> Dict[str, Any]:
+        import time
+        import torch.distributed as _dist
+        rank = _dist.get_rank() if _dist.is_initialized() else 0
+        if rank == 0:
+            torch.cuda.synchronize()
+            _t0 = time.time()
+
+        result = super()._post_encode(model, inputs)
+
+        if rank == 0:
+            torch.cuda.synchronize()
+            print(f'[PROFILE] _post_encode (template hook): {(time.time() - _t0) * 1000:.2f} ms', flush=True)
+        return result
+
+    @classmethod
+    def _load_point_cloud(cls, pc_path: str) -> torch.Tensor:
+        """Load a point-cloud .npy file with in-memory caching."""
+        if pc_path not in cls._pc_cache:
+            import numpy as np
+            pc_data = np.load(pc_path)
+            cls._pc_cache[pc_path] = torch.from_numpy(pc_data).float()
+        return cls._pc_cache[pc_path]
+
+    def _preprocess_inputs(self, inputs: StdTemplateInputs) -> None:
+        """Override to cache image loading + rescaling (only 33 unique images)."""
+        from ..vision_utils import load_image, rescale_image
+        if inputs.images:
+            new_images = []
+            for img in inputs.images:
+                if isinstance(img, str) and img in self._img_cache:
+                    new_images.append(self._img_cache[img])
+                else:
+                    path_key = img if isinstance(img, str) else None
+                    loaded = self._load_image(img, True)
+                    if self.max_pixels is not None:
+                        loaded = rescale_image(loaded, self.max_pixels)
+                    if path_key:
+                        self._img_cache[path_key] = loaded
+                    new_images.append(loaded)
+            inputs.images = new_images
+        # Call the parent for remaining preprocessing (function call, tags, etc.)
+        # Images are already PIL objects so the parent will skip re-loading/rescaling.
+        super()._preprocess_inputs(inputs)
+
+    def replace_tag(self, media_type, index, inputs: StdTemplateInputs):
+        if media_type == 'point_cloud':
+            return [self.point_cloud_token]
+        if media_type == 'image':
+            # Cache the expensive fetch_image call per unique image path
+            img = inputs.images[index]
+            # Build a cache key from the image identity (use id for PIL objects)
+            cache_key = id(img)
+            if cache_key in self._fetch_img_cache:
+                inputs.images[index] = self._fetch_img_cache[cache_key]
+            else:
+                from qwen_vl_utils import fetch_image
+                kwargs = {'image_patch_size': self.processor.image_processor.patch_size}
+                inputs.images[index] = fetch_image({'image': img}, **kwargs)
+                self._fetch_img_cache[cache_key] = inputs.images[index]
+            if self.mode == 'lmdeploy':
+                return ['<|vision_start|>', [-100], '<|vision_end|>']
+            else:
+                return ['<|vision_start|><|image_pad|><|vision_end|>']
+        return super().replace_tag(media_type, index, inputs)
+
+    def _encode(self, inputs: StdTemplateInputs) -> Dict[str, Any]:
+        """Override parent _encode to add image_processor caching + point cloud handling."""
+        encoded = Template._encode(self, inputs)
+        processor = self.processor
+        input_ids = encoded['input_ids']
+        labels = encoded['labels']
+        loss_scale = encoded.get('loss_scale', None)
+
+        # ---- images (with image_processor cache) ----
+        mm_data = inputs.images
+        if mm_data:
+            media_token = self.image_token_id
+            cache_key = tuple(id(img) for img in mm_data)
+            if cache_key in self._img_processor_cache:
+                media_inputs = self._img_processor_cache[cache_key]
+            else:
+                media_inputs = processor.image_processor(
+                    images=mm_data, return_tensors='pt', do_resize=False)
+                self._img_processor_cache[cache_key] = media_inputs
+            media_grid_thw = media_inputs['image_grid_thw']
+            idx_list = findall(input_ids, media_token)
+            merge_length = processor.image_processor.merge_size ** 2
+
+            def _get_new_img_tokens(i):
+                token_len = (media_grid_thw[i].prod() // merge_length)
+                return [media_token] * token_len
+
+            input_ids, labels, loss_scale = self._extend_tokens(
+                input_ids, labels, loss_scale, idx_list, _get_new_img_tokens)
+            encoded.update(media_inputs)
+
+        # ---- videos (pass-through, same as parent) ----
+        mm_data = inputs.videos
+        if mm_data:
+            split_token = self._tokenize('\n')[0]
+            media_inputs = processor(
+                text=['\n'.join(['<|vision_start|><|video_pad|><|vision_end|>'] * len(mm_data))],
+                videos=mm_data, return_tensors='pt', do_resize=False,
+                **inputs.mm_processor_kwargs)
+            splited_tokens = self._split_list(media_inputs['input_ids'][0].tolist(), split_token)
+            media_grid_thw = media_inputs['video_grid_thw']
+            media_inputs.pop('input_ids', None)
+            media_inputs.pop('attention_mask', None)
+            media_token = self.video_token_id
+            idx_list = findall(input_ids, media_token)
+            merge_length = processor.image_processor.merge_size ** 2
+
+            def _get_new_vid_tokens(i):
+                return splited_tokens[i]
+
+            input_ids, labels, loss_scale = self._extend_tokens(
+                input_ids, labels, loss_scale, idx_list, _get_new_vid_tokens)
+            encoded.update(media_inputs)
+
+        encoded['input_ids'] = input_ids
+        encoded['labels'] = labels
+        encoded['loss_scale'] = loss_scale
+
+        # ---- point clouds ----
+        if inputs.point_clouds:
+            point_cloud_token_id = self.tokenizer.convert_tokens_to_ids(self.point_cloud_token)
+            num_queries = getattr(self.config, 'num_point_cloud_queries', 256)
+
+            all_features = []
+            point_cloud_sizes = []
+            for pc_path in inputs.point_clouds:
+                pc_tensor = self._load_point_cloud(pc_path)
+                all_features.append(pc_tensor)
+                point_cloud_sizes.append(pc_tensor.shape[0])
+
+            idx_list = findall(encoded['input_ids'], point_cloud_token_id)
+
+            def _get_new_pc_tokens(i):
+                return [point_cloud_token_id] * num_queries
+
+            encoded['input_ids'], encoded['labels'], encoded['loss_scale'] = self._extend_tokens(
+                encoded['input_ids'], encoded['labels'], encoded.get('loss_scale', None),
+                idx_list, _get_new_pc_tokens)
+            encoded['point_cloud_features'] = torch.cat(all_features, dim=0)
+            encoded['point_cloud_sizes'] = torch.tensor(point_cloud_sizes, dtype=torch.long)
+
+        return encoded
+
+    def _data_collator_mm_data(self, batch: List[Dict[str, Any]]) -> Dict[str, Any]:
+        res = super()._data_collator_mm_data(batch)
+        point_cloud_features = self.concat_tensor(batch, 'point_cloud_features', 0)
+        if point_cloud_features is not None:
+            res['point_cloud_features'] = point_cloud_features
+        point_cloud_sizes = self.concat_tensor(batch, 'point_cloud_sizes', 0)
+        if point_cloud_sizes is not None:
+            res['point_cloud_sizes'] = point_cloud_sizes
+        return res
+
+
+register_template(
+    QwenTemplateMeta(
+        MLLMTemplateType.qwen3_vl_point_cloud,
+        template_cls=Qwen3VLPointCloudTemplate,
+        default_system=None,
+        thinking_prefix='<think>\n',
+    ))
+
+
 class Qwen3_5Template(Qwen3VLTemplate):
     image_token_id = 248056
     video_token_id = 248057

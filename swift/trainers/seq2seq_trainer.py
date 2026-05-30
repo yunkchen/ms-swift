@@ -2,10 +2,12 @@
 # Part of the implementation is borrowed from huggingface/transformers.
 import inspect
 import os
+import time
 from contextlib import contextmanager, nullcontext
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import torch
+import torch.distributed as dist
 from peft import PeftModel
 from torch import nn
 from torch.nn.utils.rnn import pad_sequence
@@ -22,6 +24,12 @@ from .utils import per_token_loss_func, per_token_loss_func_sp
 
 logger = get_logger()
 
+# ============================================================
+# Profiling configuration: only instrument first N training
+# steps to minimise synchronisation overhead.
+# ============================================================
+PROFILE_MAX_STEPS = 5
+
 
 class Seq2SeqTrainer(SwiftMixin, DataLoaderMixin, HfSeq2SeqTrainer):
     args: Seq2SeqTrainingArguments
@@ -33,6 +41,11 @@ class Seq2SeqTrainer(SwiftMixin, DataLoaderMixin, HfSeq2SeqTrainer):
             self.infer_engine = TransformersEngine(
                 self.model, template=self.template, max_batch_size=self.args.per_device_eval_batch_size)
         self.jsonl_writer = JsonlWriter(os.path.join(self.args.output_dir, 'predict.jsonl'))
+
+        # ---- profiling state ----
+        self._profile_step_count = 0
+        self._profiling_hooks_registered = False
+        self._in_profiled_forward = False
 
     @staticmethod
     def _predict_data_collator(batch):
@@ -96,9 +109,101 @@ class Seq2SeqTrainer(SwiftMixin, DataLoaderMixin, HfSeq2SeqTrainer):
         labels_list = pad_sequence(labels_list, batch_first=True, padding_value=0)
         return None, response_list, labels_list
 
+    # ================================================================
+    #  Profiling helpers – register timing hooks on model sub-modules
+    # ================================================================
+
+    @staticmethod
+    def _get_profile_rank():
+        return dist.get_rank() if dist.is_initialized() else 0
+
+    def _should_profile(self):
+        return self._profile_step_count <= PROFILE_MAX_STEPS
+
+    def _register_profiling_hooks(self):
+        """Register forward pre/post hooks on key sub-modules to measure
+        per-component latency inside the model forward pass.
+
+        Hooks only print when ``_in_profiled_forward`` is ``True`` and within
+        the first ``PROFILE_MAX_STEPS`` training steps, so they are
+        effectively no-ops during gradient-checkpointing recomputation and
+        after warm-up.
+        """
+        rank = self._get_profile_rank()
+        trainer_ref = self  # prevent capturing self in closures
+
+        # ---- locate inner model ----
+        unwrapped = self.accelerator.unwrap_model(self.model)
+        # PeftModel wrapping: unwrapped.model.model -> base Qwen3VL model
+        inner = unwrapped
+        for _ in range(3):  # at most 3 levels
+            if hasattr(inner, 'model') and inner.model is not inner:
+                inner = inner.model
+            else:
+                break
+
+        # ---- collect target modules ----
+        target_modules: Dict[str, nn.Module] = {}
+        for name in [
+            'visual',                          # vision encoder
+            'point_cloud_resampler',           # point-cloud perceiver
+            'point_cloud_deepstack_projectors',# point-cloud MLP projectors
+            'embed_tokens',                    # text token embedding
+            'layers',                          # all transformer decoder layers
+            'norm',                            # final RMSNorm
+        ]:
+            mod = getattr(inner, name, None)
+            if mod is not None:
+                target_modules[name] = mod
+
+        # lm_head may live one level up
+        for candidate in [unwrapped, getattr(unwrapped, 'model', None)]:
+            if candidate is not None and hasattr(candidate, 'lm_head'):
+                target_modules['lm_head'] = candidate.lm_head
+                break
+
+        # ---- hook factories ----
+        def _make_pre_hook(mod_name):
+            def hook(module, args, kwargs=None):
+                if rank == 0 and trainer_ref._in_profiled_forward and trainer_ref._should_profile():
+                    torch.cuda.synchronize()
+                    module._profile_start = time.time()
+            return hook
+
+        def _make_post_hook(mod_name):
+            def hook(module, args, output):
+                if rank == 0 and trainer_ref._in_profiled_forward and trainer_ref._should_profile():
+                    start = getattr(module, '_profile_start', None)
+                    if start is not None:
+                        torch.cuda.synchronize()
+                        elapsed_ms = (time.time() - start) * 1000
+                        print(f'[PROFILE] {mod_name}: {elapsed_ms:.2f} ms', flush=True)
+            return hook
+
+        for mod_name, mod in target_modules.items():
+            mod.register_forward_pre_hook(_make_pre_hook(mod_name))
+            mod.register_forward_hook(_make_post_hook(mod_name))
+
+        if rank == 0:
+            print(f'[PROFILE] Registered timing hooks on: {list(target_modules.keys())}', flush=True)
+
+    # ================================================================
+
     def _prepare_inputs(self, inputs):
+        rank = self._get_profile_rank()
+        should_profile = self._should_profile()
+
+        if rank == 0 and should_profile:
+            torch.cuda.synchronize()
+            _t0 = time.time()
+
         args = self.args
         inputs = super()._prepare_inputs(inputs)
+
+        if rank == 0 and should_profile:
+            torch.cuda.synchronize()
+            print(f'[PROFILE] _prepare_inputs (to_device + SP): {(time.time() - _t0) * 1000:.2f} ms', flush=True)
+
         if self.template.sequence_parallel_size > 1:
             sequence_parallel.prepare_inputs(inputs)
 
@@ -135,7 +240,23 @@ class Seq2SeqTrainer(SwiftMixin, DataLoaderMixin, HfSeq2SeqTrainer):
                 logger.warning_once('The cross_entropy loss function defined in Liger Kernel will not '
                                     'take effect, potentially leading to increased GPU memory consumption.')
             labels = inputs.pop('labels')
+
+        # ---- profiled model forward ----
+        rank = self._get_profile_rank()
+        should_profile = self._should_profile()
+
+        if rank == 0 and should_profile:
+            torch.cuda.synchronize()
+            _t_fwd = time.time()
+
+        self._in_profiled_forward = True
         outputs = model(**inputs)
+        self._in_profiled_forward = False
+
+        if rank == 0 and should_profile:
+            torch.cuda.synchronize()
+            print(f'[PROFILE] model(**inputs) total: {(time.time() - _t_fwd) * 1000:.2f} ms', flush=True)
+
         if getattr(outputs, 'aux_loss', None) is not None:
             mode = 'train' if self.model.training else 'eval'
             self.custom_metrics[mode]['aux_loss'].update(outputs.aux_loss)
@@ -224,5 +345,26 @@ class Seq2SeqTrainer(SwiftMixin, DataLoaderMixin, HfSeq2SeqTrainer):
         return (loss, outputs) if return_outputs else loss
 
     def training_step(self, model, inputs, *args, **kwargs):
+        # ---- one-time hook registration ----
+        if not self._profiling_hooks_registered:
+            self._register_profiling_hooks()
+            self._profiling_hooks_registered = True
+
+        self._profile_step_count += 1
+        rank = self._get_profile_rank()
+        should_profile = self._should_profile()
+
+        if rank == 0 and should_profile:
+            torch.cuda.synchronize()
+            _t_step = time.time()
+
         with self.template.forward_context(self.model, inputs):
-            return super().training_step(model, inputs, *args, **kwargs)
+            result = super().training_step(model, inputs, *args, **kwargs)
+
+        if rank == 0 and should_profile:
+            torch.cuda.synchronize()
+            elapsed_ms = (time.time() - _t_step) * 1000
+            print(f'[PROFILE] step={self._profile_step_count} | total_training_step: {elapsed_ms:.2f} ms', flush=True)
+            print('[PROFILE] ' + '=' * 60, flush=True)
+
+        return result
